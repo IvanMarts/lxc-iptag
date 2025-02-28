@@ -11,6 +11,7 @@ LOOP_INTERVAL=60
 FW_NET_INTERFACE_CHECK_INTERVAL=60
 LXC_STATUS_CHECK_INTERVAL=-1
 FORCE_UPDATE_INTERVAL=1800
+VM_STATUS_CHECK_INTERVAL=60
 
 if [ -f "/usr/local/etc/lxc-iptag.conf" ]; then
     # shellcheck source=./lxc-iptag.conf
@@ -93,6 +94,56 @@ fw_net_interface_changed() {
 
 # =============== MAIN =============== #
 
+update_vm_iptags() {
+    vmid_list=$(qm list 2>/dev/null | grep -v VMID | awk '{print $1}')
+    for vmid in ${vmid_list}; do
+        # Check if the VM ID is in the exclusion list
+        if [[ " ${EXCLUSION_LIST[*]} " == *" ${vmid} "* ]]; then
+            echo "Skipping ${vmid} as it is in the exclusion list"
+            continue
+        fi
+
+        last_tagged_ips=()
+        current_valid_ips=()
+        next_tags=()
+
+        # Parse current tags
+        mapfile -t current_tags < <(qm config "${vmid}" | grep tags | awk '{print $2}' | sed 's/;/\n/g')
+        for current_tag in "${current_tags[@]}"; do
+            if is_valid_ipv4 "${current_tag}"; then
+                last_tagged_ips+=("${current_tag}")
+                continue
+            fi
+            next_tags+=("${current_tag}")
+        done
+
+        # Get current IPs
+        current_ips_full=$(qm guest cmd "${vmid}" network-get-interfaces | jq -r '.[] | .["ip-addresses"][]? | ."ip-address"')
+        for ip in ${current_ips_full}; do
+            # Check if the IP is in the exclusion list
+            if [[ " ${EXCLUSION_LIST[*]} " == *" ${ip} "* ]]; then
+                echo "Skipping IP ${ip} for VM ${vmid} as it is in the exclusion list"
+                continue
+            fi
+
+            if is_valid_ipv4 "${ip}" && ip_in_cidrs "${ip}" "${CIDR_LIST[*]}"; then
+                current_valid_ips+=("${ip}")
+                next_tags+=("${ip}")
+            fi
+        done
+
+        # Skip if no ip change
+        if [[ "$(echo "${last_tagged_ips[@]}" | tr ' ' '\n' | sort -u)" == "$(echo "${current_valid_ips[@]}" | tr ' ' '\n' | sort -u)" ]]; then
+            echo "Skipping ${vmid} cause ip no changes"
+            continue
+        fi
+
+        # Set tags
+        echo "Setting ${vmid} tags from ${current_tags[*]} to ${next_tags[*]}"
+        qm set "${vmid}" -tags "$(IFS=';'; echo "${next_tags[*]}")"
+    done
+}
+
 update_lxc_iptags() {
     vmid_list=$(pct list 2>/dev/null | grep -v VMID | awk '{print $1}')
     for vmid in ${vmid_list}; do
@@ -147,6 +198,7 @@ init() {
     current_time=$(date +%s)
     last_lxc_status_check_time=${current_time}
     last_fw_net_interface_check_time=${current_time}
+    last_vm_status_check_time=${current_time}
     fw_net_interface_changed
     last_update_time=0
 }
@@ -176,6 +228,16 @@ check() {
             last_update_time=${current_time}
             return
         fi
+    fi
+
+    time_since_last_vm_status_check=$((current_time - last_vm_status_check_time))
+    if [[ "${VM_STATUS_CHECK_INTERVAL}" -gt 0 ]] \
+        && [[ "${time_since_last_vm_status_check}" -ge "${VM_STATUS_CHECK_INTERVAL}" ]]; then
+        echo "Checking VM status..."
+        last_vm_status_check_time=${current_time}
+        update_vm_iptags
+        last_update_time=${current_time}
+        return
     fi
 
     time_since_last_update=$((current_time - last_update_time))
