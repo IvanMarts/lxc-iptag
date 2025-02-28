@@ -1,3 +1,6 @@
+Like the original but with VMs Ips too, simply.
+
+
 # lxc-iptag
 
 lxc-iptag is a simple script to add ip tags to LXC containers.
